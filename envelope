@@ -23,6 +23,7 @@ b64_2_bytes(){ #convert base64 encoded string to bytes
 }
 
 decrypt(){
+
   #Header read
   signature_lenght=$(echo -n "$steam_signature"|wc --bytes)
   cur_signature=$(read_bytes $signature_lenght)
@@ -41,16 +42,32 @@ decrypt(){
   if [ -n "$pdkdf2_iteration_count" ]; then
     pdkdf2_iteration_flag="-iter $pdkdf2_iteration_count"
   fi
+  if [ -n "$password" ]; then 
+    password_key='-passin file:<(echo -n $password)'
+  fi
   encrypted_session_key_lenght_hex=$(read_bytes 4|xxd -ps)
   encrypted_session_key_b64=$(read_bytes $(hex2dec $encrypted_session_key_lenght_hex)|base64 -w0)
-  session_key_b64=$(openssl rsautl -decrypt -inkey <(echo -n "$private_key_txt") -in <(b64_2_bytes $encrypted_session_key_b64) -passin file:<(echo -n $password) -out >(base64 -w0))
+  session_key_b64=$(eval openssl pkeyutl -decrypt \
+    -inkey <(echo -n "$private_key_txt") \
+    -in <(b64_2_bytes $encrypted_session_key_b64) \
+    $password_key \
+    -out >(base64 -w0) \
+    -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 )
   if [ -z "$session_key_b64" ]; then
     (>&2 echo "Failed to extract session key.")
     exit 1
   fi
   md5_file_pipe=$(mktemp -u)
   md5_file_calc=$(mktemp -u)
-  openssl enc -d -$session_proto -md $pass_digest $pdkdf2_iteration_flag -pass file:<(b64_2_bytes $session_key_b64)|tee >(tail -c $checksum_lenght > $md5_file_pipe;touch $md5_file_pipe.ok)|head -c -$checksum_lenght|tee >(openssl md5 -binary > $md5_file_calc;touch $md5_file_calc.ok)
+  openssl enc -d \
+      -$session_proto -md \
+      $pass_digest \
+      $pdkdf2_iteration_flag \
+      -pass file:<(b64_2_bytes \
+      $session_key_b64) \
+    |tee >(tail -c $checksum_lenght > $md5_file_pipe;touch $md5_file_pipe.ok)\
+    |head -c -$checksum_lenght\
+    |tee >(openssl md5 -binary > $md5_file_calc;touch $md5_file_calc.ok)
   if ! cmp -s $md5_file_pipe $md5_file_calc; then
      (>&2 echo "Checksum error.")
   fi
@@ -61,6 +78,7 @@ decrypt(){
   rm -f $md5_file_pipe.ok
   rm -f $md5_file_calc
   rm -f $md5_file_calc.ok
+
 }
 #---sfx_cut---
 
@@ -81,14 +99,18 @@ steam_with_crc(){ #cat stdin + <md5 checksum of stdin>
 }
 encrypt(){
   session_key_b64=$(openssl rand $session_key_lenght|base64 -w0)
-  encrypted_session_key_b64=$(openssl rsautl -encrypt -inkey <(echo -n "$public_key_txt") -pubin -in <(b64_2_bytes $session_key_b64) -out >(base64 -w0))
+  encrypted_session_key_b64=$(openssl pkeyutl -encrypt \
+    -inkey <(echo -n "$public_key_txt") \
+    -pubin -in <(b64_2_bytes $session_key_b64) \
+    -out >(base64 -w0) \
+    -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 )
   encrypted_session_key_lenght=$(b64_2_bytes $encrypted_session_key_b64|wc --bytes)
 
   #header
   echo -n "$steam_signature"
   echo -ne "$encrypt_alg\0"
   echo -ne "$private_key_txt\0"
-  echo -ne "$pdftk_iteration_count\0"
+  echo -ne "$pdkdf2_iteration_count\0"
   echo -ne "$pass_digest\0"
   pdkdf2_iteration_flag=""
   if [ -n "$pdkdf2_iteration_count" ]; then
@@ -97,14 +119,21 @@ encrypt(){
   
   printf "%.8x" $encrypted_session_key_lenght|xxd -r -p
   b64_2_bytes "$encrypted_session_key_b64"
-  steam_with_crc|openssl enc -$encrypt_alg $pdkdf2_iteration_flag -md $pass_digest -salt -pass file:<(b64_2_bytes $session_key_b64)
+  steam_with_crc \
+  |openssl enc \
+    -$encrypt_alg \
+    $pdkdf2_iteration_flag \
+    -md $pass_digest \
+    -salt \
+    -pass file:<(b64_2_bytes $session_key_b64)
 }
 
 
 
 max_rsa_content_lenght_for_key() {
   key_size=$(openssl rsa -in <(echo -n "$1") -pubin -text -noout|sed -nr 's/.*Public-Key: \(([0-9]+) bit\)/\1/p') #key lenght in bytes
-  hash_size=160 #SHA-1 hash size
+  #hash_size=160 #SHA-1 hash size
+  hash_size=256
   echo $(( (key_size+7)/8-(2*hash_size)/8-2 )) #calculate maximum session key lenght for given public key lenght
 }  
 
@@ -151,8 +180,9 @@ cat << EO
 Usage: $progname [options]
 
 Options:
+
 EO
-cat <<EO | column -s\& -te
+cat <<EO | column -s\& -tL
   -h|--help&show this help
   -v|--version&show version info
 
@@ -165,16 +195,19 @@ cat <<EO | column -s\& -te
 
   --public-key <file>&Public key for creating envelope
   --private-key <file>&Private key for self extracting archive (must be encrypted when creating sfx envelope)
+  --password <password>&Private key password for decryption
 
   --sfx&create self extracting archive
   --encrypt-alg&Encryption algotithm. Default $encrypt_alg
+
 EO
 }
 
 shortopts="hv"
-longopts="help,version,create,extract,envelope:,in:,out:,public-key:,private-key:,sfx,encrypt-alg:"
+longopts="help,version,create,extract,envelope:,in:,out:,public-key:,private-key:,sfx,encrypt-alg:,password:"
 args=$(getopt -s bash --options $shortopts --longoptions $longopts --name $progname -- "$@" )
 eval set -- "$args"
+password="$ENVELOPE_PASSWORD"
 
 while true; do
   case $1 in
@@ -190,7 +223,7 @@ while true; do
       parametr_name=${1:2}
       declare "${parametr_name//-/_}"="yes" #variable name is $1 without -- and with replace "-"->"_"
       ;;
-    --envelope|--out|--public-key|--private-key|--in|--encrypt-alg)
+    --envelope|--out|--public-key|--private-key|--in|--encrypt-alg|--password)
       parametr_name=${1:2}
       declare "${parametr_name//-/_}"="$(printf '%q' "$2")" #variable name is $1 without -- and with replace "-"->"_"
       shift
@@ -220,18 +253,13 @@ if [ -f "$public_key" ]; then
 fi
 
 if [ "$extract" == "yes" ]; then
-  if [ -z "$password" ]; then
-    echo -n Password: 
-    read -s password
-    echo
-  fi
   cat ${in}|decrypt > ${out}  
   
 else if [ "$create" == "yes" ]; then
   #Calculated vaules
   session_key_lenght=$(max_rsa_content_lenght_for_key "$public_key_txt")
-  pdkdf2_iteration_count="" #Set this to number when using openssl>=1.1.1 fo better pass to key algorythm
-  pass_digest="md5" #md5 hardcoded into openssl <=1.0.2, sha256 default for openssl >1.0.2
+  pdkdf2_iteration_count="10000" #Set this to number when using openssl>=1.1.1 fo better pass to key algorythm
+  pass_digest="sha256" #md5 hardcoded into openssl <=1.0.2, sha256 default for openssl >1.0.2
   >${out}
   if [ "$sfx" == "yes" ]; then
     sfx_script >> ${out}
